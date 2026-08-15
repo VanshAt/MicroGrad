@@ -1,7 +1,8 @@
 """
 micrograd/engine.py
 --------------------
-Day 2 — Arithmetic: Values can now add, subtract, multiply and divide.
+Day 3 — Gradients: every Value now tracks its gradient and knows how
+to propagate it one step backwards through the computation graph.
 
 Philosophy
 ----------
@@ -10,14 +11,25 @@ Raw floats and ints are "dead" — they carry no history, no identity, no
 future.  A `Value` gives a number a name, a type guarantee, and a
 place to grow as we add math, gradients, and backprop in later days.
 
-Today we hand the actors their lines:
-    - Arithmetic operators return new Value nodes.
-    - Each result remembers *which operation* created it (_op).
-    - Each result remembers *which parent nodes* fed into it (_prev).
-    → These two fields are the skeleton of the computation graph that
-      backpropagation will traverse in later days.
+What's new today:
+    - `.grad` attribute — accumulated gradient ∂L/∂self, starts at 0.0.
+    - `._backward` callable — a zero-arg closure attached to every
+      operation node.  When called it propagates *this node's* gradient
+      one step backwards to its immediate parents using the local
+      chain-rule formula for that specific operation.
+    - `zero_grad()` — resets .grad to 0.0 on this node and every
+      ancestor.  Like PyTorch's optimizer.zero_grad().
 
-No gradients yet — that's Day 3/4.
+    → These pieces are the fuel that Day 4's `.backward()` will ignite:
+      a topological sort over the graph, calling every ._backward() in
+      the right order to accumulate gradients all the way to the leaves.
+
+Note on accumulation (+=, not =)
+---------------------------------
+Gradients are *summed*, not replaced, because the same Value node can
+appear multiple times in an expression (e.g. x*x).  Each path through
+the graph contributes its own partial derivative and they must all be
+added together (multivariate chain rule).
 """
 
 from __future__ import annotations
@@ -48,11 +60,21 @@ class Value:
         The parent Value nodes that were inputs to the operation.
         Empty for leaf nodes.
 
+    grad : float
+        Accumulated gradient ∂L/∂self.  Starts at 0.0 and is filled in
+        by calling `._backward()` on descendant nodes (or `backward()`
+        on the root, which is Day 4's job).
+    _backward : Callable[[], None]
+        Zero-argument closure that propagates *this* node's `.grad` one
+        step backwards to its immediate parents.  Leaf nodes use a no-op
+        lambda.  Set automatically by arithmetic operators.
+
     Notes
     -----
     Day 1 scope  — wrapping + identity.
     Day 2 scope  — arithmetic operators + computation graph skeleton.
-    Days ahead   — gradients, backward pass, activations.
+    Day 3 scope  — .grad attribute + local ._backward closures + zero_grad().
+    Days ahead   — full backward pass, activation functions.
     """
 
     # ------------------------------------------------------------------
@@ -114,6 +136,15 @@ class Value:
         # Computation-graph metadata (populated by arithmetic operators).
         self._op: str = _op                          # e.g. '+', '*', '**'
         self._prev: frozenset["Value"] = frozenset(_prev)  # parent nodes
+
+        # ── Day 3 additions ──────────────────────────────────────────────
+        # Accumulated gradient ∂L/∂self.  Starts at zero; backprop fills it.
+        self.grad: float = 0.0
+
+        # Local chain-rule step — propagates *this* node's .grad one hop
+        # backwards to its parents.  Leaf nodes use the no-op lambda.
+        # Arithmetic operators overwrite this with their own closure.
+        self._backward = lambda: None
 
     # ------------------------------------------------------------------
     # Identity & display
@@ -241,7 +272,16 @@ class Value:
         other = self._coerce(other)
         if other is NotImplemented:
             return NotImplemented
-        return Value(self.data + other.data, _op="+", _prev=(self, other))
+        out = Value(self.data + other.data, _op="+", _prev=(self, other))
+
+        # Chain rule: d(a+b)/da = 1,  d(a+b)/db = 1
+        # We capture `self` and `other` by closing over them.
+        def _backward() -> None:
+            self.grad  += out.grad * 1.0
+            other.grad += out.grad * 1.0
+
+        out._backward = _backward
+        return out
 
     def __radd__(self, other: object) -> "Value":
         """other + self  (called when `other` is a plain number)"""
@@ -270,7 +310,15 @@ class Value:
         other = self._coerce(other)
         if other is NotImplemented:
             return NotImplemented
-        return Value(self.data * other.data, _op="*", _prev=(self, other))
+        out = Value(self.data * other.data, _op="*", _prev=(self, other))
+
+        # Chain rule: d(a*b)/da = b,  d(a*b)/db = a
+        def _backward() -> None:
+            self.grad  += out.grad * other.data
+            other.grad += out.grad * self.data
+
+        out._backward = _backward
+        return out
 
     def __rmul__(self, other: object) -> "Value":
         """other * self  (called when `other` is a plain number)"""
@@ -306,11 +354,60 @@ class Value:
             raise TypeError(
                 f"Exponent must be int or float, got {type(exponent).__name__!r}."
             )
-        return Value(self.data ** exponent, _op=f"**{exponent}", _prev=(self,))
+        out = Value(self.data ** exponent, _op=f"**{exponent}", _prev=(self,))
+
+        # Chain rule: d(a**n)/da = n * a**(n-1)
+        def _backward() -> None:
+            self.grad += out.grad * exponent * (self.data ** (exponent - 1))
+
+        out._backward = _backward
+        return out
+
+    # ------------------------------------------------------------------
+    # Gradient utilities  (Day 3)
+    # ------------------------------------------------------------------
+
+    def zero_grad(self) -> None:
+        """
+        Reset `.grad` to 0.0 on this node and every ancestor in the graph.
+
+        Walks the full computation graph (topological order, ancestors
+        first) so every parameter's gradient is cleared before a new
+        forward + backward pass.
+
+        Mirrors PyTorch's ``optimizer.zero_grad()``.
+
+        Examples
+        --------
+        >>> w = Value(0.5, label="w")
+        >>> x = Value(2.0, label="x")
+        >>> out = w * x
+        >>> out.grad = 1.0
+        >>> out._backward()
+        >>> w.grad
+        2.0
+        >>> out.zero_grad()  # reset the whole graph
+        >>> w.grad
+        0.0
+        """
+        # Collect all nodes reachable from self via _prev (BFS/DFS).
+        visited: set["Value"] = set()
+        topo: list["Value"] = []
+
+        def _build(node: "Value") -> None:
+            if node not in visited:
+                visited.add(node)
+                for parent in node._prev:
+                    _build(parent)
+                topo.append(node)
+
+        _build(self)
+
+        for node in topo:
+            node.grad = 0.0
 
     # ------------------------------------------------------------------
     # Future hook placeholders
     # ------------------------------------------------------------------
-    # Day 3 additions → .grad attribute, ._backward callable
-    # Day 4 additions → .backward() full backpropagation
+    # Day 4 additions → .backward() full backpropagation (topological sort)
     # Day 5 additions → activation functions: tanh, relu, sigmoid, exp
