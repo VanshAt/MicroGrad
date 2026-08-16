@@ -1,8 +1,7 @@
 """
 micrograd/engine.py
 --------------------
-Day 3 — Gradients: every Value now tracks its gradient and knows how
-to propagate it one step backwards through the computation graph.
+Day 4 — `.backward()`: full reverse-mode autodiff in one call.
 
 Philosophy
 ----------
@@ -11,7 +10,15 @@ Raw floats and ints are "dead" — they carry no history, no identity, no
 future.  A `Value` gives a number a name, a type guarantee, and a
 place to grow as we add math, gradients, and backprop in later days.
 
-What's new today:
+What's new in Day 4:
+    - `.backward()` — seeds self.grad = 1.0, performs a topological
+      sort of the entire computation graph, then calls every node's
+      `._backward()` closure in *reverse* topological order so that by
+      the time a node's `._backward()` fires, its own `.grad` has
+      already been fully accumulated from all its consumers.
+
+What was added previously:
+    Day 3:
     - `.grad` attribute — accumulated gradient ∂L/∂self, starts at 0.0.
     - `._backward` callable — a zero-arg closure attached to every
       operation node.  When called it propagates *this node's* gradient
@@ -20,16 +27,22 @@ What's new today:
     - `zero_grad()` — resets .grad to 0.0 on this node and every
       ancestor.  Like PyTorch's optimizer.zero_grad().
 
-    → These pieces are the fuel that Day 4's `.backward()` will ignite:
-      a topological sort over the graph, calling every ._backward() in
-      the right order to accumulate gradients all the way to the leaves.
-
 Note on accumulation (+=, not =)
 ---------------------------------
 Gradients are *summed*, not replaced, because the same Value node can
 appear multiple times in an expression (e.g. x*x).  Each path through
 the graph contributes its own partial derivative and they must all be
 added together (multivariate chain rule).
+
+Topological order
+-----------------
+A computation graph is a DAG (directed acyclic graph): edges point
+from parent (input) to child (output).  Backprop must visit nodes in
+reverse — outputs before inputs — so that when we call a node's
+._backward(), the downstream gradients that feed into it are already
+fully computed.  A DFS post-order traversal produces exactly this
+ordering (children before their dependants), and reversing it gives us
+the correct backprop order.
 """
 
 from __future__ import annotations
@@ -74,7 +87,8 @@ class Value:
     Day 1 scope  — wrapping + identity.
     Day 2 scope  — arithmetic operators + computation graph skeleton.
     Day 3 scope  — .grad attribute + local ._backward closures + zero_grad().
-    Days ahead   — full backward pass, activation functions.
+    Day 4 scope  — .backward() full reverse-mode autodiff.
+    Days ahead   — activation functions (tanh, relu, sigmoid, exp).
     """
 
     # ------------------------------------------------------------------
@@ -178,8 +192,18 @@ class Value:
         return Value(abs(self.data), label=f"|{self.label}|" if self.label else "")
 
     def __neg__(self) -> "Value":
-        """Unary negation — returns -self as a new Value."""
-        return Value(-self.data, label=f"-{self.label}" if self.label else "")
+        """Unary negation — returns -self as a proper graph node.
+
+        Chain rule: d(-a)/da = -1
+        """
+        out = Value(-self.data, _op="neg", _prev=(self,),
+                    label=f"-{self.label}" if self.label else "")
+
+        def _backward() -> None:
+            self.grad += out.grad * -1.0
+
+        out._backward = _backward
+        return out
 
     def __pos__(self) -> "Value":
         """Unary positive — returns a copy."""
@@ -364,8 +388,32 @@ class Value:
         return out
 
     # ------------------------------------------------------------------
-    # Gradient utilities  (Day 3)
+    # Gradient utilities  (Day 3 & 4)
     # ------------------------------------------------------------------
+
+    def _topo_sort(self) -> list["Value"]:
+        """
+        Return all nodes reachable from `self` in topological order.
+
+        The list is ordered so that every node appears *after* all of
+        its parents (i.e. DFS post-order over the ``_prev`` edges).  To
+        get the correct backprop order, reverse this list.
+
+        Shared by `zero_grad()` and `backward()` so the traversal logic
+        lives in exactly one place.
+        """
+        visited: set["Value"] = set()
+        topo: list["Value"] = []
+
+        def _build(node: "Value") -> None:
+            if node not in visited:
+                visited.add(node)
+                for parent in node._prev:
+                    _build(parent)
+                topo.append(node)
+
+        _build(self)
+        return topo
 
     def zero_grad(self) -> None:
         """
@@ -390,24 +438,66 @@ class Value:
         >>> w.grad
         0.0
         """
-        # Collect all nodes reachable from self via _prev (BFS/DFS).
-        visited: set["Value"] = set()
-        topo: list["Value"] = []
-
-        def _build(node: "Value") -> None:
-            if node not in visited:
-                visited.add(node)
-                for parent in node._prev:
-                    _build(parent)
-                topo.append(node)
-
-        _build(self)
-
-        for node in topo:
+        for node in self._topo_sort():
             node.grad = 0.0
+
+    def backward(self) -> None:
+        """
+        Run full reverse-mode automatic differentiation from this node.
+
+        After this call every ancestor's ``.grad`` holds the partial
+        derivative of *this* output w.r.t. that ancestor, i.e.:
+
+            node.grad  ==  ∂(self) / ∂(node)
+
+        Algorithm
+        ---------
+        1. Build the full computation graph in topological order using
+           :meth:`_topo_sort`.
+        2. Seed ``self.grad = 1.0``  — the gradient of the output
+           w.r.t. itself is always 1.
+        3. Walk the nodes in *reverse* topological order (outputs
+           before inputs) and call each node's ``._backward()``
+           closure.  Because a node's ``.grad`` is fully accumulated
+           by all of its consumers before its own ``._backward()``
+           fires, the chain rule is applied correctly.
+
+        Notes
+        -----
+        - Gradients are **accumulated** (``+=``), not overwritten.  If
+          you call ``backward()`` twice you will double the gradients.
+          Call :meth:`zero_grad` first to reset.
+        - This method seeds ``self.grad = 1.0`` unconditionally; any
+          value you set before calling ``backward()`` is overwritten.
+
+        Examples
+        --------
+        >>> a = Value(2.0, label="a")
+        >>> b = Value(3.0, label="b")
+        >>> c = a * b           # c.data == 6.0
+        >>> c.backward()
+        >>> a.grad              # ∂c/∂a = b = 3.0
+        3.0
+        >>> b.grad              # ∂c/∂b = a = 2.0
+        2.0
+
+        >>> x = Value(3.0)
+        >>> y = x * x           # y = x²
+        >>> y.backward()
+        >>> x.grad              # dy/dx = 2x = 6.0
+        6.0
+        """
+        topo = self._topo_sort()
+
+        # Seed: ∂self/∂self = 1
+        self.grad = 1.0
+
+        # Walk in reverse topological order — outputs before inputs.
+        for node in reversed(topo):
+            node._backward()
 
     # ------------------------------------------------------------------
     # Future hook placeholders
     # ------------------------------------------------------------------
-    # Day 4 additions → .backward() full backpropagation (topological sort)
     # Day 5 additions → activation functions: tanh, relu, sigmoid, exp
+    # Day 6 additions → Neuron / Layer / MLP classes

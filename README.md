@@ -13,7 +13,7 @@ Inspired by [Andrej Karpathy's micrograd](https://github.com/karpathy/micrograd)
 | **1** | `Value` — wrap a scalar in an object | ✅ Done |
 | **2** | Arithmetic operators (`+`, `−`, `×`, `÷`, `**`) | ✅ Done |
 | **3** | `.grad` & `._backward` — every node tracks its gradient | ✅ Done |
-| 4 | `.backward()` — full reverse-mode autodiff | ⏳ |
+| **4** | `.backward()` — full reverse-mode autodiff | ✅ Done |
 | 5 | Activation functions (`tanh`, `relu`, `sigmoid`, `exp`) | ⏳ |
 | 6 | `Neuron` / `Layer` / `MLP` — a real tiny neural net | ⏳ |
 
@@ -64,6 +64,54 @@ Value("oops")     # TypeError: must be int or float
 Value(1.0) < Value(2.0)   # True
 sorted([Value(3), Value(1), Value(2)])  # [1.0, 2.0, 3.0]
 ```
+
+---
+
+## ⚡ Day 4 — `.backward()`: Full Reverse-Mode Autodiff
+
+Day 4 wires together all the pieces built in Days 1–3 into a **single call** that
+propagates gradients through the entire computation graph automatically.
+
+Internally, `.backward()` does three things:
+1. **Topological sort** — DFS post-order traversal of the `_prev` graph.
+2. **Seed** — sets `self.grad = 1.0` (∂L/∂L is always 1).
+3. **Reverse walk** — calls each node's `._backward()` in reverse topo order.
+
+Because a node's `._backward()` only fires *after* all its consumers have
+already accumulated their contributions into its `.grad`, the chain rule is
+always applied correctly — even for shared nodes and diamond-shaped graphs.
+
+```python
+from micrograd import Value
+
+# A linear neuron: out = w*x + b
+w   = Value(0.5, label="w")
+x   = Value(2.0, label="x")
+b   = Value(0.3, label="b")
+out = w * x + b
+
+out.backward()   # one call — that's it
+
+print(w.grad)   # 2.0  (∂out/∂w = x)
+print(x.grad)   # 0.5  (∂out/∂x = w)
+print(b.grad)   # 1.0  (∂out/∂b = 1)
+
+# Gradient accumulation works for shared nodes
+x2 = Value(3.0)
+y  = x2 * x2      # x2 appears in both parent slots
+y.backward()
+print(x2.grad)  # 6.0  (dy/dx = 2x = 2*3)
+
+# Training loop pattern
+for step in range(10):
+    loss.zero_grad()   # 1. clear stale gradients
+    # forward pass ...  # 2. compute loss
+    loss.backward()    # 3. compute all gradients
+    # param.data -= lr * param.grad  # 4. update
+```
+
+**Key insight:** `backward()` also extracts the topological-sort DFS into a
+shared `_topo_sort()` helper, so `zero_grad()` reuses the same traversal logic.
 
 ---
 
@@ -161,7 +209,8 @@ Expected output:
 tests/test_day01.py ...  PASSED
 tests/test_day02.py ...  PASSED
 tests/test_day03.py ...  PASSED
-≥ 70 passed in 0.XXs
+tests/test_day04.py ...  PASSED
+≥ 100 passed in 0.XXs
 ```
 
 ---
@@ -172,6 +221,7 @@ tests/test_day03.py ...  PASSED
 python examples/day01_demo.py
 python examples/day02_demo.py
 python examples/day03_demo.py
+python examples/day04_demo.py
 ```
 
 ---
@@ -186,11 +236,13 @@ MicroGrad/
 ├── tests/
 │   ├── test_day01.py     # Day 1 test suite
 │   ├── test_day02.py     # Day 2 test suite
-│   └── test_day03.py     # Day 3 test suite
+│   ├── test_day03.py     # Day 3 test suite
+│   └── test_day04.py     # Day 4 test suite
 ├── examples/
 │   ├── day01_demo.py     # Day 1 interactive walkthrough
 │   ├── day02_demo.py     # Day 2 interactive walkthrough
-│   └── day03_demo.py     # Day 3 interactive walkthrough
+│   ├── day03_demo.py     # Day 3 interactive walkthrough
+│   └── day04_demo.py     # Day 4 interactive walkthrough
 ├── pyproject.toml        # Build config & metadata
 ├── .gitignore
 └── README.md
