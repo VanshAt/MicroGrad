@@ -67,6 +67,58 @@ sorted([Value(3), Value(1), Value(2)])  # [1.0, 2.0, 3.0]
 
 ---
 
+## 🔥 Day 5 — Activation Functions
+
+Day 5 wires five non-linearities into the autograd engine — the building
+blocks every real neural network needs to learn complex functions.
+
+| Method | Forward | Backward (chain rule) |
+|---|---|---|
+| `.exp()` | `eˣ` | `out.grad × out.data` |
+| `.log()` | `ln x` (x > 0) | `out.grad / x` |
+| `.tanh()` | `(e²ˣ−1)/(e²ˣ+1)` | `out.grad × (1 − t²)` |
+| `.relu()` | `max(0, x)` | `out.grad if x > 0 else 0` |
+| `.sigmoid()` | `1/(1+e⁻ˣ)` | `out.grad × s × (1−s)` |
+
+`tanh` and `sigmoid` are **fused** — single graph nodes rather than
+composed sub-graphs — for a cleaner computation graph and better
+numerical stability.
+
+```python
+from micrograd import Value
+
+# Every activation is fully differentiable
+x = Value(1.0, label="x")
+
+print(x.tanh().data)     # 0.7616  — classic neuron activation
+print(x.relu().data)     # 1.0     — positive pass-through
+print(x.sigmoid().data)  # 0.7311  — logistic output
+print(x.exp().data)      # 2.7183
+print(x.log().data)      # 0.0  (ln(1) = 0)
+
+# Full backward pass — single neuron with tanh
+x1 = Value(2.0,  label="x1")
+x2 = Value(0.0,  label="x2")
+w1 = Value(-3.0, label="w1")
+w2 = Value(1.0,  label="w2")
+b  = Value(6.8813735870195432, label="b")
+
+n = x1 * w1 + x2 * w2 + b
+o = n.tanh()
+o.backward()
+
+# d(o)/d(n) = 1 - tanh²(n) ≈ 0.5
+print(w1.grad)  # -1.5  (≈ x1 × d(tanh)/dn)
+print(x1.grad)  # -1.5  (≈ w1 × d(tanh)/dn)
+```
+
+**Key insight:** `relu` blocks gradients entirely for negative inputs (the
+"dead neuron" problem); `tanh` and `sigmoid` squash gradients near
+saturation (the "vanishing gradient" problem). Both are important to
+understand before building deep networks in Day 6.
+
+---
+
 ## ⚡ Day 4 — `.backward()`: Full Reverse-Mode Autodiff
 
 Day 4 wires together all the pieces built in Days 1–3 into a **single call** that
@@ -210,7 +262,8 @@ tests/test_day01.py ...  PASSED
 tests/test_day02.py ...  PASSED
 tests/test_day03.py ...  PASSED
 tests/test_day04.py ...  PASSED
-≥ 100 passed in 0.XXs
+tests/test_day05.py ...  PASSED
+≥ 150 passed in 0.XXs
 ```
 
 ---
@@ -237,7 +290,8 @@ MicroGrad/
 │   ├── test_day01.py     # Day 1 test suite
 │   ├── test_day02.py     # Day 2 test suite
 │   ├── test_day03.py     # Day 3 test suite
-│   └── test_day04.py     # Day 4 test suite
+│   ├── test_day04.py     # Day 4 test suite
+│   └── test_day05.py     # Day 5 test suite
 ├── examples/
 │   ├── day01_demo.py     # Day 1 interactive walkthrough
 │   ├── day02_demo.py     # Day 2 interactive walkthrough

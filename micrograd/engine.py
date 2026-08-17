@@ -1,7 +1,7 @@
 """
 micrograd/engine.py
 --------------------
-Day 4 — `.backward()`: full reverse-mode autodiff in one call.
+Day 5 — Activation functions: exp, log, tanh, relu, sigmoid.
 
 Philosophy
 ----------
@@ -10,7 +10,15 @@ Raw floats and ints are "dead" — they carry no history, no identity, no
 future.  A `Value` gives a number a name, a type guarantee, and a
 place to grow as we add math, gradients, and backprop in later days.
 
-What's new in Day 4:
+What's new in Day 5:
+    - `.exp()`     — eˣ,        backward: out.grad * out.data
+    - `.log()`     — natural log, backward: out.grad / self.data
+    - `.tanh()`    — hyperbolic tangent (fused), backward: out.grad*(1-t²)
+    - `.relu()`    — max(0, x), backward: out.grad if x > 0 else 0
+    - `.sigmoid()` — 1/(1+e⁻ˣ) (fused), backward: out.grad*s*(1-s)
+
+What was added previously:
+    Day 4:
     - `.backward()` — seeds self.grad = 1.0, performs a topological
       sort of the entire computation graph, then calls every node's
       `._backward()` closure in *reverse* topological order so that by
@@ -88,7 +96,8 @@ class Value:
     Day 2 scope  — arithmetic operators + computation graph skeleton.
     Day 3 scope  — .grad attribute + local ._backward closures + zero_grad().
     Day 4 scope  — .backward() full reverse-mode autodiff.
-    Days ahead   — activation functions (tanh, relu, sigmoid, exp).
+    Day 5 scope  — activation functions: exp, log, tanh, relu, sigmoid.
+    Days ahead   — Neuron / Layer / MLP.
     """
 
     # ------------------------------------------------------------------
@@ -497,7 +506,191 @@ class Value:
             node._backward()
 
     # ------------------------------------------------------------------
+    # Activation functions  (Day 5)
+    # ------------------------------------------------------------------
+    # Design rules (same as arithmetic operators):
+    #   1. Always return a new Value — Values are immutable nodes.
+    #   2. Record _op and _prev so the computation graph stays complete.
+    #   3. The _backward closure captures all values needed for the
+    #      chain-rule formula via closure (no extra state on the node).
+    #   4. Fused implementations (tanh, sigmoid) are preferred over
+    #      composing existing ops: they produce a single, clean graph
+    #      node and avoid numerical issues from intermediate exp().
+
+    def exp(self) -> "Value":
+        """
+        Elementwise natural exponential: e^self.
+
+        Forward:  out = e^x
+        Backward: d(e^x)/dx = e^x = out  →  self.grad += out.grad * out.data
+
+        Notes
+        -----
+        For very large positive inputs (x > ~709) Python's math.exp raises
+        OverflowError.  This mirrors PyTorch's behaviour — callers must
+        ensure inputs are in a reasonable range.
+
+        Examples
+        --------
+        >>> v = Value(1.0)
+        >>> v.exp().data
+        2.718281828459045
+
+        >>> v = Value(0.0)
+        >>> v.exp().data
+        1.0
+        """
+        out = Value(math.exp(self.data), _op="exp", _prev=(self,))
+
+        # d(e^x)/dx = e^x — we reuse the already-computed out.data.
+        def _backward() -> None:
+            self.grad += out.grad * out.data
+
+        out._backward = _backward
+        return out
+
+    def log(self) -> "Value":
+        """
+        Elementwise natural logarithm: ln(self).
+
+        Forward:  out = ln(x)       (x must be > 0)
+        Backward: d(ln x)/dx = 1/x  →  self.grad += out.grad / self.data
+
+        Raises
+        ------
+        ValueError
+            If self.data <= 0 (log is undefined for non-positive reals).
+
+        Examples
+        --------
+        >>> import math
+        >>> v = Value(math.e)
+        >>> round(v.log().data, 10)
+        1.0
+
+        >>> Value(1.0).log().data
+        0.0
+        """
+        if self.data <= 0:
+            raise ValueError(
+                f"log() requires a strictly positive input, got {self.data}."
+            )
+        out = Value(math.log(self.data), _op="log", _prev=(self,))
+
+        def _backward() -> None:
+            self.grad += out.grad / self.data
+
+        out._backward = _backward
+        return out
+
+    def tanh(self) -> "Value":
+        """
+        Hyperbolic tangent activation (fused).
+
+        Forward:  t = tanh(x) = (e^2x - 1) / (e^2x + 1)
+        Backward: d(tanh x)/dx = 1 - tanh²(x) = 1 - t²
+                  self.grad += out.grad * (1 - out.data ** 2)
+
+        Why fused?
+        ----------
+        Computing tanh via existing ops (exp, div, sub, add) would create
+        a multi-node sub-graph and obscure the structure of the network.
+        A fused node keeps the graph clean and is numerically equivalent.
+
+        Examples
+        --------
+        >>> Value(0.0).tanh().data
+        0.0
+
+        >>> round(Value(1.0).tanh().data, 6)
+        0.761594
+        """
+        t = math.tanh(self.data)
+        out = Value(t, _op="tanh", _prev=(self,))
+
+        # 1 - t² is the sech²(x) derivative of tanh.
+        def _backward() -> None:
+            self.grad += out.grad * (1.0 - out.data ** 2)
+
+        out._backward = _backward
+        return out
+
+    def relu(self) -> "Value":
+        """
+        Rectified Linear Unit activation.
+
+        Forward:  out = max(0, x)
+        Backward: d/dx max(0,x) = 1 if x > 0 else 0
+                  self.grad += out.grad * (1 if self.data > 0 else 0)
+
+        Notes
+        -----
+        - The subgradient at x=0 is defined to be 0 (consistent with
+          PyTorch's default).
+        - ReLU is the most common hidden-layer activation in modern MLPs
+          because it is cheap to compute and avoids the vanishing-gradient
+          problem that tanh/sigmoid suffer from in deep networks.
+
+        Examples
+        --------
+        >>> Value(3.0).relu().data
+        3.0
+
+        >>> Value(-2.0).relu().data
+        0.0
+
+        >>> Value(0.0).relu().data
+        0.0
+        """
+        out = Value(max(0.0, self.data), _op="relu", _prev=(self,))
+
+        def _backward() -> None:
+            self.grad += out.grad * (1.0 if self.data > 0 else 0.0)
+
+        out._backward = _backward
+        return out
+
+    def sigmoid(self) -> "Value":
+        """
+        Logistic sigmoid activation (fused).
+
+        Forward:  s = 1 / (1 + e^{-x})
+        Backward: d/dx sigmoid(x) = s * (1 - s)
+                  self.grad += out.grad * out.data * (1 - out.data)
+
+        Why fused?
+        ----------
+        Same reasoning as tanh — keeps the graph compact and avoids
+        precision loss from chaining multiple exp/div nodes.
+
+        Notes
+        -----
+        For numerical stability the implementation uses the standard
+        formula which is well-conditioned for all finite x:
+          - Large positive x → e^{-x} ≈ 0 → s ≈ 1
+          - Large negative x → e^{-x} is huge → s ≈ 0
+        Neither case causes overflow because we only ever compute e^{-x},
+        which is bounded above (1) when x ≥ 0.
+
+        Examples
+        --------
+        >>> Value(0.0).sigmoid().data
+        0.5
+
+        >>> round(Value(2.0).sigmoid().data, 6)
+        0.880797
+        """
+        s = 1.0 / (1.0 + math.exp(-self.data))
+        out = Value(s, _op="sigmoid", _prev=(self,))
+
+        # s*(1-s) is the classic sigmoid derivative.
+        def _backward() -> None:
+            self.grad += out.grad * out.data * (1.0 - out.data)
+
+        out._backward = _backward
+        return out
+
+    # ------------------------------------------------------------------
     # Future hook placeholders
     # ------------------------------------------------------------------
-    # Day 5 additions → activation functions: tanh, relu, sigmoid, exp
     # Day 6 additions → Neuron / Layer / MLP classes
