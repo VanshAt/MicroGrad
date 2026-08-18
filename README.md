@@ -14,8 +14,8 @@ Inspired by [Andrej Karpathy's micrograd](https://github.com/karpathy/micrograd)
 | **2** | Arithmetic operators (`+`, `−`, `×`, `÷`, `**`) | ✅ Done |
 | **3** | `.grad` & `._backward` — every node tracks its gradient | ✅ Done |
 | **4** | `.backward()` — full reverse-mode autodiff | ✅ Done |
-| 5 | Activation functions (`tanh`, `relu`, `sigmoid`, `exp`) | ⏳ |
-| 6 | `Neuron` / `Layer` / `MLP` — a real tiny neural net | ⏳ |
+| **5** | Activation functions (`tanh`, `relu`, `sigmoid`, `exp`) | ✅ Done |
+| **6** | `Neuron` / `Layer` / `MLP` — a real tiny neural net | ✅ Done |
 
 ---
 
@@ -64,6 +64,64 @@ Value("oops")     # TypeError: must be int or float
 Value(1.0) < Value(2.0)   # True
 sorted([Value(3), Value(1), Value(2)])  # [1.0, 2.0, 3.0]
 ```
+
+---
+
+## 🧠 Day 6 — `Neuron` / `Layer` / `MLP`
+
+Day 6 assembles the autograd engine from Days 1–5 into a complete, trainable
+neural network — written entirely in terms of `Value` arithmetic so every
+weight and bias is automatically differentiable.
+
+| Class | What it does |
+|---|---|
+| `Neuron(n_in, activation)` | `out = activation(w·x + b)`, Kaiming-init |
+| `Layer(n_in, n_out, activation)` | `n_out` independent Neurons, same input |
+| `MLP(n_in, layer_sizes, ...)` | Stack of Layers — a full MLP |
+
+Every class exposes:
+- **`__call__(x)`** — forward pass, accepts `list[Value | float]`
+- **`.parameters()`** — flat list of all trainable `Value` nodes
+- **`.zero_grad()`** (MLP) — O(params) gradient reset
+
+```python
+import random
+from micrograd import MLP
+
+random.seed(42)
+model = MLP(2, [4, 4, 1])   # 2 inputs → hidden(4) → hidden(4) → output(1)
+print(model)                 # MLP([Layer(..., tanh), Layer(..., tanh), Layer(..., linear)])
+print(len(model.parameters()))  # 37
+
+# Training loop
+xs = [[2.0,  3.0], [-1.0, -1.0], [1.0, -2.0], [-3.0, 1.0]]
+ys = [1.0,          -1.0,          -1.0,          1.0]
+
+for step in range(20):
+    preds = [model(x) for x in xs]
+    loss  = sum((p - t)**2 for p, t in zip(preds, ys)) / len(ys)
+
+    model.zero_grad()    # 1. clear gradients
+    loss.backward()      # 2. backprop
+
+    for p in model.parameters():
+        p.data -= 0.05 * p.grad   # 3. gradient descent
+
+    if step % 5 == 0:
+        print(f"step {step:2d}  loss={loss.data:.4f}")
+# step  0  loss=0.7062
+# step  5  loss=0.1589
+# step 10  loss=0.0690
+# step 15  loss=0.0539
+```
+
+**Key insights:**
+- Weights initialised with **Kaiming uniform** (`±1/√n_in`) — activations
+  stay well-scaled at random init.
+- The output layer defaults to **`linear`** (no activation) so the network
+  can produce unbounded values for regression or feed directly into a loss.
+- `MLP.zero_grad()` is O(params) — it only resets parameter leaves, unlike
+  `loss.zero_grad()` which walks the entire computation graph.
 
 ---
 
@@ -263,7 +321,8 @@ tests/test_day02.py ...  PASSED
 tests/test_day03.py ...  PASSED
 tests/test_day04.py ...  PASSED
 tests/test_day05.py ...  PASSED
-≥ 150 passed in 0.XXs
+tests/test_day06.py ...  PASSED
+≥ 321 passed in 0.XXs
 ```
 
 ---
@@ -275,6 +334,7 @@ python examples/day01_demo.py
 python examples/day02_demo.py
 python examples/day03_demo.py
 python examples/day04_demo.py
+python examples/day06_demo.py
 ```
 
 ---
@@ -284,19 +344,21 @@ python examples/day04_demo.py
 ```
 MicroGrad/
 ├── micrograd/
-│   ├── __init__.py       # Public API
-│   └── engine.py         # Value class (the heart of everything)
+│   ├── __init__.py       # Public API (Value, Neuron, Layer, MLP)
+│   └── engine.py         # Value class + Neuron / Layer / MLP
 ├── tests/
 │   ├── test_day01.py     # Day 1 test suite
 │   ├── test_day02.py     # Day 2 test suite
 │   ├── test_day03.py     # Day 3 test suite
 │   ├── test_day04.py     # Day 4 test suite
-│   └── test_day05.py     # Day 5 test suite
+│   ├── test_day05.py     # Day 5 test suite
+│   └── test_day06.py     # Day 6 test suite
 ├── examples/
 │   ├── day01_demo.py     # Day 1 interactive walkthrough
 │   ├── day02_demo.py     # Day 2 interactive walkthrough
 │   ├── day03_demo.py     # Day 3 interactive walkthrough
-│   └── day04_demo.py     # Day 4 interactive walkthrough
+│   ├── day04_demo.py     # Day 4 interactive walkthrough
+│   └── day06_demo.py     # Day 6 interactive walkthrough
 ├── pyproject.toml        # Build config & metadata
 ├── .gitignore
 └── README.md

@@ -1,7 +1,7 @@
 """
 micrograd/engine.py
 --------------------
-Day 5 — Activation functions: exp, log, tanh, relu, sigmoid.
+Day 6 — Neuron / Layer / MLP: a real tiny neural network.
 
 Philosophy
 ----------
@@ -10,7 +10,15 @@ Raw floats and ints are "dead" — they carry no history, no identity, no
 future.  A `Value` gives a number a name, a type guarantee, and a
 place to grow as we add math, gradients, and backprop in later days.
 
-What's new in Day 5:
+What's new in Day 6:
+    - `Neuron`  — single unit: activation(w·x + b), random init,
+                  supports tanh / relu / sigmoid / linear activations.
+    - `Layer`   — n_out Neurons reading the same input vector.
+    - `MLP`     — a stack of Layers; a full Multi-Layer Perceptron.
+    - Every class exposes `.parameters()` (flat list of Value weights)
+      and `.__call__()` (forward pass accepting list[Value|float]).
+
+What was added in Day 5:
     - `.exp()`     — eˣ,        backward: out.grad * out.data
     - `.log()`     — natural log, backward: out.grad / self.data
     - `.tanh()`    — hyperbolic tangent (fused), backward: out.grad*(1-t²)
@@ -56,6 +64,7 @@ the correct backprop order.
 from __future__ import annotations
 
 import math
+import random
 from typing import Union
 
 
@@ -97,7 +106,7 @@ class Value:
     Day 3 scope  — .grad attribute + local ._backward closures + zero_grad().
     Day 4 scope  — .backward() full reverse-mode autodiff.
     Day 5 scope  — activation functions: exp, log, tanh, relu, sigmoid.
-    Days ahead   — Neuron / Layer / MLP.
+    Day 6 scope  — Neuron / Layer / MLP.
     """
 
     # ------------------------------------------------------------------
@@ -690,7 +699,291 @@ class Value:
         out._backward = _backward
         return out
 
+
+# ==========================================================================
+# Day 6 — Neural network building blocks
+# ==========================================================================
+#
+# Three classes built entirely on `Value` arithmetic, so every weight and
+# bias is automatically differentiable through the autograd engine above.
+#
+# Design rules (consistent with the Value class above):
+#   1. All learnable parameters are `Value` nodes — no raw floats sneak in.
+#   2. __call__ accepts list[Value | float] for ergonomic use.
+#   3. parameters() returns a flat list so a training loop only needs:
+#          for p in model.parameters():
+#              p.data -= lr * p.grad
+#   4. Weights are initialised with Kaiming-style uniform ±1/√n_in scaling
+#      so that activations neither explode nor vanish at random init.
+
+
+_ACTIVATIONS = frozenset({"tanh", "relu", "sigmoid", "linear"})
+
+
+class Neuron:
+    """
+    A single artificial neuron: out = activation(w · x + b).
+
+    Parameters
+    ----------
+    n_in : int
+        Number of scalar inputs the neuron receives.
+    activation : str, optional
+        Non-linearity to apply after the dot product.
+        One of ``'tanh'`` (default), ``'relu'``, ``'sigmoid'``,
+        or ``'linear'`` (no activation — useful for output neurons).
+
+    Attributes
+    ----------
+    weights : list[Value]
+        One weight per input, initialised uniformly in
+        ``[-1/√n_in, +1/√n_in]``.
+    bias : Value
+        Scalar bias, initialised to 0.0.
+
+    Examples
+    --------
+    >>> import random; random.seed(0)
+    >>> n = Neuron(3)
+    >>> out = n([1.0, 2.0, 3.0])
+    >>> isinstance(out, Value)
+    True
+    >>> -1.0 <= out.data <= 1.0  # tanh output is bounded
+    True
+    """
+
+    def __init__(self, n_in: int, activation: str = "tanh") -> None:
+        if activation not in _ACTIVATIONS:
+            raise ValueError(
+                f"activation must be one of {sorted(_ACTIVATIONS)}, "
+                f"got {activation!r}."
+            )
+        if not isinstance(n_in, int) or n_in < 1:
+            raise ValueError(f"n_in must be a positive integer, got {n_in!r}.")
+
+        self.activation = activation
+
+        # Kaiming-style uniform: ±1/√n_in keeps variance ~1 at init.
+        limit = 1.0 / math.sqrt(n_in)
+        self.weights: list[Value] = [
+            Value(random.uniform(-limit, limit), label=f"w{i}")
+            for i in range(n_in)
+        ]
+        self.bias: Value = Value(0.0, label="b")
+
     # ------------------------------------------------------------------
-    # Future hook placeholders
+    # Forward pass
     # ------------------------------------------------------------------
-    # Day 6 additions → Neuron / Layer / MLP classes
+
+    def __call__(self, x: list) -> Value:
+        """
+        Compute the neuron's output for input vector *x*.
+
+        Parameters
+        ----------
+        x : list[Value | int | float]
+            Input activations.  Plain numbers are wrapped automatically.
+
+        Returns
+        -------
+        Value
+            The scalar output after applying the activation function.
+
+        Raises
+        ------
+        ValueError
+            If ``len(x) != len(self.weights)``.
+        """
+        if len(x) != len(self.weights):
+            raise ValueError(
+                f"Expected {len(self.weights)} inputs, got {len(x)}."
+            )
+
+        # Dot product: w · x  (coerce plain numbers to Value on the fly)
+        act: Value = sum(
+            (wi * (xi if isinstance(xi, Value) else Value(float(xi)))
+             for wi, xi in zip(self.weights, x)),
+            self.bias,
+        )
+
+        # Apply chosen non-linearity
+        if self.activation == "tanh":
+            return act.tanh()
+        if self.activation == "relu":
+            return act.relu()
+        if self.activation == "sigmoid":
+            return act.sigmoid()
+        # 'linear' — no activation
+        return act
+
+    # ------------------------------------------------------------------
+    # Parameter access
+    # ------------------------------------------------------------------
+
+    def parameters(self) -> list[Value]:
+        """Return all trainable Value nodes: weights + bias."""
+        return self.weights + [self.bias]
+
+    def __repr__(self) -> str:
+        return (
+            f"Neuron(n_in={len(self.weights)}, activation={self.activation!r})"
+        )
+
+
+class Layer:
+    """
+    A fully-connected layer: a list of *n_out* independent Neurons that
+    all receive the same input vector and each produce one scalar output.
+
+    Parameters
+    ----------
+    n_in : int
+        Number of inputs per neuron (= width of the previous layer).
+    n_out : int
+        Number of neurons in this layer (= output width).
+    activation : str, optional
+        Activation for every neuron. Default ``'tanh'``.
+
+    Examples
+    --------
+    >>> import random; random.seed(0)
+    >>> layer = Layer(2, 3)
+    >>> outs = layer([1.0, -1.0])
+    >>> len(outs)
+    3
+    >>> all(isinstance(o, Value) for o in outs)
+    True
+    """
+
+    def __init__(self, n_in: int, n_out: int, activation: str = "tanh") -> None:
+        self.neurons: list[Neuron] = [
+            Neuron(n_in, activation=activation) for _ in range(n_out)
+        ]
+
+    def __call__(self, x: list) -> list[Value]:
+        """
+        Run each neuron and return a list of scalar Value outputs.
+
+        If there is only one neuron the *list* is still returned (MLP
+        unpacks it correctly) — a single Value is never auto-unwrapped
+        here so that Layer behaviour is consistent regardless of width.
+        """
+        return [neuron(x) for neuron in self.neurons]
+
+    def parameters(self) -> list[Value]:
+        """Flat list of all Value parameters across every neuron."""
+        return [p for neuron in self.neurons for p in neuron.parameters()]
+
+    def __repr__(self) -> str:
+        return (
+            f"Layer(n_in={len(self.neurons[0].weights)}, "
+            f"n_out={len(self.neurons)}, "
+            f"activation={self.neurons[0].activation!r})"
+        )
+
+
+class MLP:
+    """
+    Multi-Layer Perceptron: a stack of fully-connected Layers.
+
+    Parameters
+    ----------
+    n_in : int
+        Number of scalar inputs to the network.
+    layer_sizes : list[int]
+        Width of each successive layer.  The final entry is the output
+        width.  Example: ``[4, 4, 1]`` creates two hidden layers of
+        width 4 followed by a single-output layer.
+    activation : str, optional
+        Activation for all *hidden* layers. Default ``'tanh'``.
+    out_activation : str, optional
+        Activation for the *output* layer. Default ``'linear'`` so the
+        network can produce unbounded values suitable for regression or
+        direct loss computation (e.g. MSE).  Set to ``'sigmoid'`` for
+        binary classification.
+
+    Attributes
+    ----------
+    layers : list[Layer]
+        The ordered list of layers.
+
+    Examples
+    --------
+    >>> import random; random.seed(42)
+    >>> model = MLP(2, [4, 4, 1])
+    >>> out = model([1.0, 2.0])
+    >>> isinstance(out, Value)      # single-output network unwraps the list
+    True
+    >>> len(model.parameters())    # (2*4+4) + (4*4+4) + (4*1+1) = 41
+    41
+    """
+
+    def __init__(
+        self,
+        n_in: int,
+        layer_sizes: list[int],
+        activation: str = "tanh",
+        out_activation: str = "linear",
+    ) -> None:
+        if not layer_sizes:
+            raise ValueError("layer_sizes must contain at least one entry.")
+
+        # Build layers: all hidden layers use `activation`, output uses
+        # `out_activation`.
+        sizes = [n_in] + list(layer_sizes)
+        self.layers: list[Layer] = [
+            Layer(
+                sizes[i],
+                sizes[i + 1],
+                activation=(
+                    activation if i < len(layer_sizes) - 1 else out_activation
+                ),
+            )
+            for i in range(len(layer_sizes))
+        ]
+
+    def __call__(self, x: list) -> "Value | list[Value]":
+        """
+        Run a forward pass through every layer in sequence.
+
+        Parameters
+        ----------
+        x : list[Value | int | float]
+            Input feature vector.
+
+        Returns
+        -------
+        Value
+            If the output layer has exactly one neuron the single Value
+            is returned directly (most common case for scalar regression
+            / binary classification).
+        list[Value]
+            Otherwise a list of output Values is returned.
+        """
+        out: list[Value] = list(x)  # copy so we don't mutate the input
+        for layer in self.layers:
+            out = layer(out)
+        # Unwrap single-output networks for ergonomics
+        return out[0] if len(out) == 1 else out
+
+    def parameters(self) -> list[Value]:
+        """Flat list of every trainable Value in the network."""
+        return [p for layer in self.layers for p in layer.parameters()]
+
+    def zero_grad(self) -> None:
+        """
+        Zero the gradient on every parameter in the network.
+
+        Convenience shortcut — equivalent to calling
+        ``p.grad = 0.0`` for every ``p`` in ``self.parameters()``.
+        Unlike ``Value.zero_grad()`` this does **not** walk the full
+        computation graph; it only resets the parameter leaves.
+        Use this instead of ``loss.zero_grad()`` in a training loop
+        — it is O(parameters) rather than O(graph nodes).
+        """
+        for p in self.parameters():
+            p.grad = 0.0
+
+    def __repr__(self) -> str:
+        layer_strs = ", ".join(repr(l) for l in self.layers)
+        return f"MLP([{layer_strs}])"

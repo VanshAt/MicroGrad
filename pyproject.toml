@@ -3,21 +3,28 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "micrograd"
-version = "0.1.0"
-description = "A minimal scalar-valued autograd engine built from scratch — day by day."
+name = "lilgrad"
+version = "0.6.0"
+description = "A minimal scalar-valued autograd engine + MLP — built from scratch, one day at a time."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "VanshAt", email = "vanshdambhare09@gmail.com" }]
-keywords = ["autograd", "deep-learning", "neural-network", "backpropagation", "education"]
+keywords = ["autograd", "deep-learning", "neural-network", "backpropagation", "education", "micrograd"]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Education",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.urls]
+Homepage = "https://github.com/VanshAt/MicroGrad"
+Source   = "https://github.com/VanshAt/MicroGrad"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov"]
